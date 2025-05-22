@@ -1,10 +1,13 @@
 import re
 import collections
 import urllib.request
+import os
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from html import escape
-from typing import Callable, Match, Optional, List, Dict, Set
+from typing import Callable, Match, Optional, List, Dict, Set, Tuple, Any
 
+from bs4 import BeautifulSoup
 import src.asana.client as asana_client
 import src.asana.logic as asana_logic
 import src.github.logic as github_logic
@@ -39,16 +42,20 @@ def task_url_from_task_id(task_id: str) -> str:
     return f"https://app.asana.com/0/0/{task_id}"
 
 
-def extract_task_fields_from_pull_request(pull_request: PullRequest) -> dict:
+def extract_task_fields_from_pull_request(pull_request: PullRequest) -> Dict[str, Any]:
     """
     Extracts and transforms all relevant fields of a GitHub PullRequest into their corresponding
     equivalent fields, as relevant to an Asana Task
-    :return: Returns the following fields: assignee, name, html_notes, followers and custom fields
+    :return: Returns the following fields: assignee, name, html_notes, images_to_attach, followers and custom fields
     """
+    description_html, images_to_attach_list = _task_description_from_pull_request(
+        pull_request
+    )
     return {
         "assignee": _task_assignee_from_pull_request(pull_request),
         "name": _task_name_from_pull_request(pull_request),
-        "html_notes": _task_description_from_pull_request(pull_request),
+        "html_notes": description_html,
+        "images_to_attach": images_to_attach_list, # Ensure this key is used
         "completed": _task_completion_from_pull_request(pull_request).is_complete,
         "custom_fields": _custom_fields_from_pull_request(pull_request),
     }
@@ -229,7 +236,9 @@ def _transform_github_mentions_to_asana_mentions(text: str) -> str:
     )
 
 
-def asana_comment_from_github_comment(comment: Comment) -> str:
+def asana_comment_from_github_comment(
+    comment: Comment,
+) -> Tuple[str, List[Dict[str, str]]]:
     """
     Extracts the GitHub author and comment text from a GitHub Comment, and transforms them into
     a suitable html comment string for Asana. This will involve looking up the GitHub author in
@@ -238,14 +247,15 @@ def asana_comment_from_github_comment(comment: Comment) -> str:
     """
     github_author = comment.author()
     display_name = _asana_display_name_for_github_user(github_author)
-    comment_text = _format_github_text_for_asana(comment.body())
-    return _wrap_in_tag("body")(
+    comment_text, images_to_attach = _format_github_text_for_asana(comment.body())
+    html_output_string = _wrap_in_tag("body")(
         display_name
         + " "
         + _wrap_in_tag("A", attrs={"href": comment.url()})("commented:")
         + "\n"
         + comment_text
     )
+    return html_output_string, images_to_attach # This function is already correct as per plan
 
 
 _image_extension_to_type = {
@@ -276,9 +286,56 @@ def _extract_attachments(body_text: str) -> List[AttachmentData]:
     return attachments
 
 
-def create_attachments(body_text: str, task_id: str) -> None:
-    attachments = _extract_attachments(body_text)
-    for attachment in attachments:
+def create_attachments(
+    body_text: str,
+    task_id: str,
+    parsed_images: Optional[List[Dict[str, str]]] = None,
+) -> None:
+    attachments_to_process: List[AttachmentData] = []
+    if parsed_images:
+        for image_dict in parsed_images:
+            try:
+                file_url = image_dict["src"]
+                alt_text = image_dict["alt"]
+
+                # Extract extension from URL path
+                parsed_url = urlparse(file_url)
+                path_part = parsed_url.path
+                _, extension = os.path.splitext(path_part)
+                extension = extension.lower()
+
+                image_type = _image_extension_to_type.get(extension)
+
+                file_name_base = alt_text if alt_text else "image_attachment"
+                
+                # Ensure filename has an extension
+                if extension and not file_name_base.endswith(extension):
+                    file_name = file_name_base + extension
+                else:
+                    file_name = file_name_base
+
+                if not image_type:
+                    logger.warning(
+                        f"Could not determine image type for {file_url}, extension {extension}. Skipping attachment."
+                    )
+                    continue
+
+                attachments_to_process.append(
+                    AttachmentData(
+                        file_name=file_name,
+                        file_url=file_url,
+                        image_type=image_type,
+                    )
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Error processing parsed image data: {image_dict}. Error: {e}. Skipping attachment."
+                )
+                continue
+    else:
+        attachments_to_process = _extract_attachments(body_text)
+
+    for attachment in attachments_to_process:
         try:
             with urllib.request.urlopen(attachment.file_url) as f:
                 attachment_contents = f.read()
@@ -337,7 +394,9 @@ def get_linked_task_ids(pull_request: PullRequest) -> Set[str]:
     return task_ids
 
 
-def asana_comment_from_github_review(review: Review) -> str:
+def asana_comment_from_github_review(
+    review: Review,
+) -> Tuple[str, List[Dict[str, str]]]:
     """
     Extracts the GitHub author and comments from a GitHub Review, and transforms them into
     a suitable html comment string for Asana. This will involve looking up the GitHub author in
@@ -347,50 +406,64 @@ def asana_comment_from_github_review(review: Review) -> str:
     user_display_name = _asana_display_name_for_github_user(review.author())
 
     if review.is_just_comments():
-        # When a user replies to an inline comment,
-        # or writes inline comments without a review,
-        # github still creates a Review object,
-        # even though nothing in github looks like a review
-        # If that's the case, there is no meaningful review state ("commented" isn't helpful)
-        # and the link to it will either not point anywhere, or be less useful than the individual links on each comment.
         review_action = _wrap_in_tag("strong")("left inline comments:\n")
     else:
         review_action = _wrap_in_tag("A", attrs={"href": review.url()})(
             _review_action_to_text_map.get(review.state(), "commented")
         )
 
-    review_body = _format_github_text_for_asana(review.body())
-    if review_body:
+    review_body_html_part, review_body_images = _format_github_text_for_asana(
+        review.body()
+    )
+    if review_body_html_part:
         header = (
             _wrap_in_tag("strong")(f"{user_display_name} {review_action} :\n")
-            + review_body
+            + review_body_html_part
         )
     else:
         header = _wrap_in_tag("strong")(f"{user_display_name} {review_action}")
 
-    # For each comment, prefix its text with a bracketed number that is a link to the Github comment.
-    inline_comments = [
-        _wrap_in_tag("A", attrs={"href": comment.url()})(f"[{i}] ")
-        + _format_github_text_for_asana(comment.body())
-        for i, comment in enumerate(review.comments(), start=1)
-    ]
-    if inline_comments:
-        comments_html = "\n".join(inline_comments)
+    all_inline_comment_images: List[Dict[str, str]] = []
+    new_inline_comments_html_parts = []
+    for i, comment_obj in enumerate(review.comments(), start=1):
+        formatted_body, single_comment_images = _format_github_text_for_asana(
+            comment_obj.body()
+        )
+        all_inline_comment_images.extend(single_comment_images)
+        linked_comment_html = (
+            _wrap_in_tag("A", attrs={"href": comment_obj.url()})(f"[{i}] ")
+            + formatted_body
+        )
+        new_inline_comments_html_parts.append(linked_comment_html)
+
+    comments_html = ""
+    if new_inline_comments_html_parts:
+        comments_html = "\n".join(new_inline_comments_html_parts)
         if not review.is_just_comments():
-            # If this was an inline reply, we already added "and left inline comments" above.
             comments_html = (
                 _wrap_in_tag("strong")("\n\nand left inline comments:\n")
                 + comments_html
             )
-    else:
-        comments_html = ""
 
-    return _wrap_in_tag("body")(header + comments_html)
+    final_html_string = _wrap_in_tag("body")(header + comments_html)
+    return final_html_string, review_body_images + all_inline_comment_images # This function is already correct as per plan
 
 
-def _format_github_text_for_asana(text: str) -> str:
-    return _transform_github_mentions_to_asana_mentions(
-        convert_github_markdown_to_asana_xml(text)
+def _format_github_text_for_asana(text: str) -> Tuple[str, List[Dict[str, str]]]:
+    soup = BeautifulSoup(text, "html.parser")
+    images_to_attach: List[Dict[str, str]] = []
+    for img_tag in soup.find_all("img"):
+        src = img_tag.get("src")
+        alt = img_tag.get("alt")
+        if src:
+            images_to_attach.append({"src": src, "alt": alt or "image"})
+        img_tag.decompose()
+    processed_text = str(soup)
+    return (
+        _transform_github_mentions_to_asana_mentions(
+            convert_github_markdown_to_asana_xml(processed_text)
+        ),
+        images_to_attach,
     )
 
 
@@ -414,7 +487,9 @@ def _generate_assignee_description(assignee: Assignee) -> str:
         return ""
 
 
-def _task_description_from_pull_request(pull_request: PullRequest) -> str:
+def _task_description_from_pull_request(
+    pull_request: PullRequest,
+) -> Tuple[str, List[Dict[str, str]]]:
     link_to_pr = _link(pull_request.url())
     github_author = pull_request.author()
     author = _asana_user_url_from_github_user_handle(github_author.login())
@@ -422,7 +497,10 @@ def _task_description_from_pull_request(pull_request: PullRequest) -> str:
         author = _asana_display_name_for_github_user(github_author)
     status_reason = _task_completion_from_pull_request(pull_request)
     status = "complete" if status_reason.is_complete else "incomplete"
-    return _wrap_in_tag("body")(
+
+    body_html, body_images = _format_github_text_for_asana(pull_request.body())
+
+    html_description = _wrap_in_tag("body")(
         _wrap_in_tag("em")(
             "This is a one-way sync from GitHub to Asana. Do not edit this task or"
             " comment on it!"
@@ -433,8 +511,9 @@ def _task_description_from_pull_request(pull_request: PullRequest) -> str:
         + _generate_assignee_description(pull_request.assignee())
         + f"\n❗️Task is {status} because {status_reason.reason}"
         + _wrap_in_tag("strong")("\n\nDescription:\n")
-        + _format_github_text_for_asana(pull_request.body())
+        + body_html
     )
+    return html_description, body_images # This function is already correct as per plan
 
 
 def _task_completion_from_pull_request(pull_request: PullRequest) -> StatusReason:

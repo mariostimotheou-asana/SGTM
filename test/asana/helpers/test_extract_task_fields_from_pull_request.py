@@ -134,6 +134,42 @@ class TestExtractsMiscellaneousFieldsFromPullRequest(BaseClass):
             "</body>",
         ]
         self.assertContainsStrings(actual, expected_strings)
+        # Check that images_to_attach is present and empty if no images in PR body mock
+        self.assertEqual(task_fields.get("images_to_attach", []), [])
+
+    @patch("src.asana.helpers._format_github_text_for_asana") # Mock for specific image test
+    def test_html_body_with_images(self, mock_format_text):
+        # This test focuses on ensuring extract_task_fields_from_pull_request correctly
+        # uses the output of _task_description_from_pull_request, which itself uses _format_github_text_for_asana.
+        # So we mock _format_github_text_for_asana to simulate image processing.
+        
+        expected_processed_body_html = "Processed PR body text without images"
+        expected_images_list = [{"src": "http://example.com/pr_image.jpg", "alt": "PR Image Alt"}]
+        mock_format_text.return_value = (expected_processed_body_html, expected_images_list)
+
+        original_pr_body_with_image = "This is the PR body with an <img src='http://example.com/pr_image.jpg' alt='PR Image Alt'>"
+        
+        pull_request = build(
+            builder.pull_request()
+            .author(builder.user("github_test_user_login"))
+            .url("https://foo.bar/baz")
+            .body(original_pr_body_with_image) # Original body with image tag
+        )
+        
+        task_fields = src.asana.helpers.extract_task_fields_from_pull_request(
+            pull_request
+        )
+        
+        # html_notes should contain the processed body, wrapped in the standard description template
+        self.assertIn(expected_processed_body_html, task_fields["html_notes"])
+        # images_to_attach should be the list from _format_github_text_for_asana
+        self.assertEqual(task_fields["images_to_attach"], expected_images_list)
+        
+        # Ensure _format_github_text_for_asana was called with the original PR body
+        mock_format_text.assert_called_once_with(original_pr_body_with_image)
+        # Ensure the raw image tag is not in the final html_notes
+        self.assertNotIn("<img", task_fields["html_notes"].lower())
+
 
     def test_html_body_assigns_to_self(self):
         pull_request = build(
@@ -160,10 +196,12 @@ class TestExtractsMiscellaneousFieldsFromPullRequest(BaseClass):
             "<strong>",
             "Description:",
             "</strong>",
-            "BODY",
+            "BODY", # This will be the result of _format_github_text_for_asana, which is mocked to pass through by default for other tests
             "</body>",
         ]
         self.assertContainsStrings(actual, expected_strings)
+        self.assertEqual(task_fields.get("images_to_attach", []), [])
+
 
     def test_html_body_assigns_to_first(self):
         pull_request = build(
@@ -200,6 +238,7 @@ class TestExtractsMiscellaneousFieldsFromPullRequest(BaseClass):
             "</body>",
         ]
         self.assertContainsStrings(actual, expected_strings)
+        self.assertEqual(task_fields.get("images_to_attach", []), [])
 
     def test_html_body_status_not_closed(self):
         pull_request = build(
@@ -221,6 +260,7 @@ class TestExtractsMiscellaneousFieldsFromPullRequest(BaseClass):
             "</body>",
         ]
         self.assertContainsStrings(actual, expected_strings)
+        self.assertEqual(task_fields.get("images_to_attach", []), [])
 
     def test_html_body_status_closed_not_merged(self):
         pull_request = build(
@@ -243,6 +283,7 @@ class TestExtractsMiscellaneousFieldsFromPullRequest(BaseClass):
             "</body>",
         ]
         self.assertContainsStrings(actual, expected_strings)
+        self.assertEqual(task_fields.get("images_to_attach", []), [])
 
     @patch("src.github.logic.pull_request_approved_before_merging")
     def test_html_body_status_closed_approved_before(self, approved_before_merging):
@@ -267,6 +308,7 @@ class TestExtractsMiscellaneousFieldsFromPullRequest(BaseClass):
             "</body>",
         ]
         self.assertContainsStrings(actual, expected_strings)
+        self.assertEqual(task_fields.get("images_to_attach", []), [])
 
     @patch("src.github.logic.pull_request_approved_before_merging")
     def test_html_body_status_followup_review(self, approved_before_merging):
@@ -291,6 +333,9 @@ class TestExtractsMiscellaneousFieldsFromPullRequest(BaseClass):
             "</body>",
         ]
         self.assertContainsStrings(actual, expected_strings)
+        self.assertEqual(task_fields.get("images_to_attach", []), [])
+        self.assertEqual(task_fields.get("images_to_attach", []), [])
+        self.assertEqual(task_fields.get("images_to_attach", []), [])
 
     @patch("src.github.logic.pull_request_approved_before_merging")
     @patch("src.github.logic.pull_request_approved_after_merging")
@@ -375,6 +420,34 @@ class TestExtractsMiscellaneousFieldsFromPullRequest(BaseClass):
             "</body>",
         ]
         self.assertContainsStrings(actual, expected_strings)
+        # Check that images_to_attach is present and empty if no images in PR body mock
+        self.assertEqual(task_fields.get("images_to_attach", []), [])
+
+
+    @patch("src.asana.helpers._format_github_text_for_asana")
+    def test_html_body_with_images(self, mock_format_text):
+        # Mock _format_github_text_for_asana which is called by _task_description_from_pull_request
+        expected_html_after_format = "Processed PR body with no images"
+        expected_images_list = [{"src": "pr_image.png", "alt": "PR Image"}]
+        mock_format_text.return_value = (expected_html_after_format, expected_images_list)
+
+        pull_request = build(
+            builder.pull_request()
+            .author(builder.user("github_test_user_login"))
+            .url("https://foo.bar/baz")
+            .body("BODY with <img src='pr_image.png' alt='PR Image'>") # Original body
+        )
+        task_fields = src.asana.helpers.extract_task_fields_from_pull_request(
+            pull_request
+        )
+        
+        actual_html_notes = task_fields["html_notes"]
+        # The actual_html_notes will be wrapped with other PR info, so check if the core part is there
+        self.assertIn(expected_html_after_format, actual_html_notes)
+        self.assertEqual(task_fields["images_to_attach"], expected_images_list)
+        
+        # Verify that _format_github_text_for_asana was called with the original PR body
+        mock_format_text.assert_called_once_with("BODY with <img src='pr_image.png' alt='PR Image'>")
 
 
 @patch(
@@ -982,6 +1055,8 @@ class TestExtractsInconsistentFieldsFromPullRequest(BaseClass):
             pull_request
         )
         self.assertEqual(True, task_fields["completed"])
+        # Check that images_to_attach is present and empty if no images in PR body mock
+        self.assertEqual(task_fields.get("images_to_attach", []), [])
 
 
 @patch("src.aws.dynamodb_client.get_asana_id_from_github_node_id", return_value="0")
